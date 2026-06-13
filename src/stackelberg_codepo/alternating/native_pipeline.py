@@ -75,6 +75,7 @@ def run_full_algorithm_smoke(cfg: dict[str, Any]) -> dict[str, Any]:
     sampling = table(cfg, "sampling")
     training = table(cfg, "training")
     evaluation = table(cfg, "evaluation")
+    leader_cleaning = table(cfg, "leader_cleaning")
 
     run_name = str(cfg.get("run_name", "full_algorithm_smoke"))
     work_dir = resolve_path(cfg, paths["work_dir"])
@@ -174,18 +175,26 @@ def run_full_algorithm_smoke(cfg: dict[str, Any]) -> dict[str, Any]:
         )
         _require_nonempty(leader_round_wpo, "leader round WPO")
 
+        clean_command = [
+            "/opt/conda/bin/python", "-m", "stackelberg_codepo.preference.leader_cleaning_wpo",
+            "--input", str(leader_round_wpo),
+            "--output-wpo", str(leader_clean_wpo),
+            "--summary", str(leader_clean_dir / f"{run_name}_leader_initial_clean_summary.json"),
+            "--dpo-output", str(leader_clean_dpo),
+            "--dataset-name", leader_dataset_name,
+            "--trajectories", str(trajectories),
+            "--max-pairs-per-task", str(leader_cleaning.get("max_pairs_per_task", 3)),
+            "--min-response-chars", str(leader_cleaning.get("min_response_chars", 80)),
+        ]
+        _append_if_value(clean_command, "--min-chosen-pass-rate", leader_cleaning.get("min_chosen_pass_rate"))
+        _append_if_value(clean_command, "--min-chosen-utility", leader_cleaning.get("min_chosen_utility"))
+        if leader_cleaning.get("require_chosen_passed", False):
+            clean_command.append("--require-chosen-passed")
+        if leader_cleaning.get("drop_rejected_overreach", False):
+            clean_command.append("--drop-rejected-overreach")
         _run_stage(
             "03_clean_initial_leader_pairs",
-            [
-                "/opt/conda/bin/python", "-m", "stackelberg_codepo.preference.leader_cleaning_wpo",
-                "--input", str(leader_round_wpo),
-                "--output-wpo", str(leader_clean_wpo),
-                "--summary", str(leader_clean_dir / f"{run_name}_leader_initial_clean_summary.json"),
-                "--dpo-output", str(leader_clean_dpo),
-                "--dataset-name", leader_dataset_name,
-                "--max-pairs-per-task", "3",
-                "--min-response-chars", "80",
-            ],
+            clean_command,
             project_root,
             env,
             log_dir,

@@ -80,6 +80,42 @@ def utility_delta(item: dict[str, Any]) -> float:
         return 0.0
 
 
+def trajectory_id(item: dict[str, Any], key: str) -> str | None:
+    metadata = item.get("metadata", {})
+    value = metadata.get(key, item.get(key))
+    return str(value) if value else None
+
+
+def trajectory_metrics(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "passed": bool(row.get("passed", False)),
+        "pass_rate": float(row.get("pass_rate", row.get("pass_rate_raw", 0.0)) or 0.0),
+        "leader_utility": row.get("leader_utility"),
+        "role_boundary_penalty_total": row.get("role_boundary_penalty_total"),
+    }
+
+
+def load_trajectory_metrics(path: str | None) -> dict[str, dict[str, Any]]:
+    if not path:
+        return {}
+    rows = load_jsonl(Path(path))
+    metrics: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        tid = row.get("trajectory_id") or row.get("id")
+        if tid:
+            metrics[str(tid)] = trajectory_metrics(row)
+    return metrics
+
+
+def metadata_float(item: dict[str, Any], key: str, default: float = 0.0) -> float:
+    metadata = item.get("metadata", {})
+    value = metadata.get(key, item.get(key, default))
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def has_overreach(text: str) -> bool:
     return any(pattern.search(text) for pattern in OVERREACH_PATTERNS)
 
@@ -147,21 +183,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-response-chars", type=int, default=80)
     parser.add_argument("--max-pairs-per-task", type=int, default=3)
     parser.add_argument("--drop-rejected-overreach", action="store_true")
+    parser.add_argument("--trajectories", default=None, help="Optional trajectory JSONL used for chosen pass-rate quality gates.")
+    parser.add_argument("--min-chosen-pass-rate", type=float, default=None)
+    parser.add_argument("--require-chosen-passed", action="store_true")
+    parser.add_argument("--min-chosen-utility", type=float, default=None)
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     rows = load_jsonl(Path(args.input))
+    trajectory_metrics_by_id = load_trajectory_metrics(args.trajectories)
     stats: dict[str, Any] = {
         "input": args.input,
         "num_input": len(rows),
+        "trajectories": args.trajectories,
+        "num_trajectory_metrics": len(trajectory_metrics_by_id),
         "min_response_chars": args.min_response_chars,
         "max_pairs_per_task": args.max_pairs_per_task,
         "drop_rejected_overreach": bool(args.drop_rejected_overreach),
+        "min_chosen_pass_rate": args.min_chosen_pass_rate,
+        "require_chosen_passed": bool(args.require_chosen_passed),
+        "min_chosen_utility": args.min_chosen_utility,
         "dropped_short": 0,
         "dropped_chosen_overreach": 0,
         "dropped_rejected_overreach": 0,
+        "dropped_missing_chosen_metrics": 0,
+        "dropped_chosen_pass_rate": 0,
+        "dropped_chosen_not_passed": 0,
+        "dropped_chosen_utility": 0,
         "dropped_duplicate_chosen": 0,
         "dropped_task_cap": 0,
     }
@@ -180,9 +230,29 @@ def main() -> int:
         if args.drop_rejected_overreach and has_overreach(rejected):
             stats["dropped_rejected_overreach"] += 1
             continue
+        chosen_tid = trajectory_id(item, "chosen_trajectory_id")
+        chosen_metrics = trajectory_metrics_by_id.get(chosen_tid or "")
+        if args.min_chosen_pass_rate is not None or args.require_chosen_passed:
+            if not chosen_metrics:
+                stats["dropped_missing_chosen_metrics"] += 1
+                continue
+            chosen_pass_rate = float(chosen_metrics.get("pass_rate", 0.0))
+            if args.min_chosen_pass_rate is not None and chosen_pass_rate < args.min_chosen_pass_rate:
+                stats["dropped_chosen_pass_rate"] += 1
+                continue
+            if args.require_chosen_passed and not bool(chosen_metrics.get("passed", False)):
+                stats["dropped_chosen_not_passed"] += 1
+                continue
+        if args.min_chosen_utility is not None and metadata_float(item, "chosen_utility") < args.min_chosen_utility:
+            stats["dropped_chosen_utility"] += 1
+            continue
         set_response_text(item, "chosen", chosen)
         set_response_text(item, "rejected", rejected)
         item.setdefault("metadata", {})
+        if chosen_metrics:
+            item["metadata"]["chosen_passed"] = bool(chosen_metrics.get("passed", False))
+            item["metadata"]["chosen_pass_rate"] = float(chosen_metrics.get("pass_rate", 0.0))
+            item["metadata"]["chosen_role_boundary_penalty_total"] = chosen_metrics.get("role_boundary_penalty_total")
         item["metadata"]["clean_initial_leader_text"] = True
         item["metadata"]["clean_initial_source"] = args.input
         candidates.append(item)

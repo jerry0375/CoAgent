@@ -1,0 +1,21 @@
+{
+  "run_name": "tiny_smoke",
+  "paths": {
+    "tasks": "fixtures/tiny_tasks.jsonl",
+    "trajectories": "fixtures/tiny_trajectories.jsonl",
+    "output_dir": "outputs/tiny_smoke"
+  },
+  "utility": {
+    "lambda_round": 0.02,
+    "lambda_token": 0.00001,
+    "leader_margin": 0.01,
+    "follower_margin": 0.01,
+    "weight_min": 0.3,
+    "weight_max": 2.0,
+    "weight_power": 0.65
+  },
+  "execution": {
+    "timeout_seconds": 2.0
+  }
+}
+

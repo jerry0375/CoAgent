@@ -1,0 +1,2 @@
+{"task_id":"toy_001","entry_point":"add_one","prompt":"def add_one(x):\n    \"\"\"Return x + 1.\"\"\"","tests":[{"args":[1],"expected":2},{"args":[-1],"expected":0},{"args":[10],"expected":11}]}
+

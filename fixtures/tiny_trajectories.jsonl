@@ -1,0 +1,4 @@
+{"trajectory_id":"traj_good","task_id":"toy_001","rounds":1,"plan":"Estimated effort tokens: 40\nUse direct integer addition and return x + 1. Edge cases include negative and zero values.","code":"def add_one(x):\n    return x + 1\n","planner_tokens":42,"coder_tokens":12}
+{"trajectory_id":"traj_bad","task_id":"toy_001","rounds":1,"plan":"Estimated effort tokens: 90\nUse a conditional branch, but be careful with negative values.","code":"def add_one(x):\n    return x - 1\n","planner_tokens":50,"coder_tokens":12}
+{"trajectory_id":"traj_overreach","task_id":"toy_001","rounds":1,"plan":"Estimated effort tokens: 30\nHere is the implementation:\ndef add_one(x):\n    return x + 1","code":"def add_one(x):\n    return x + 1\n","planner_tokens":55,"coder_tokens":12}
+

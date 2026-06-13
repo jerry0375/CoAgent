@@ -1,0 +1,32 @@
+{
+  "run_name": "real_trajectories_smoke",
+  "paths": {
+    "trajectories": "outputs/full_algorithm_smoke/sample/full_algorithm_smoke_sample_trajectories.jsonl",
+    "output_dir": "outputs/real_trajectories_smoke"
+  },
+  "limits": {
+    "max_tasks": 3,
+    "max_trajectories": 9
+  },
+  "utility": {
+    "lambda_round": 0.02,
+    "lambda_token": 1e-05,
+    "leader_margin": 0.03,
+    "follower_margin": 0.02,
+    "weight_min": 0.3,
+    "weight_max": 2.0,
+    "weight_power": 0.65
+  },
+  "training": {
+    "enabled": true,
+    "model_path": "/workspace/models/Qwen2.5-Coder-1.5B-Instruct",
+    "output_dir": "outputs/real_trajectories_smoke/adapters",
+    "cuda_visible_devices": "1",
+    "device": "cuda:0",
+    "max_steps": 1,
+    "max_samples": 4,
+    "max_length": 1024,
+    "learning_rate": 5e-06,
+    "beta": 0.1
+  }
+}

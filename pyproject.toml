@@ -1,0 +1,9 @@
+[project]
+name = "stackelberg-codepo"
+version = "0.1.0"
+description = "Modular skeleton for Stackelberg incentive-aware collaborative code generation experiments."
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+

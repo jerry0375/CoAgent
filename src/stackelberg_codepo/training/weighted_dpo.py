@@ -10,7 +10,7 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, PeftModel, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
@@ -109,6 +109,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", default="/workspace/models/Qwen2.5-Coder-1.5B-Instruct")
     parser.add_argument("--data", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--adapter-path", default=None, help="Optional LoRA adapter used to warm-start the trainable policy.")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--max-steps", type=int, default=3)
     parser.add_argument("--max-samples", type=int, default=16)
@@ -150,15 +151,21 @@ def main() -> int:
         low_cpu_mem_usage=True,
     )
     policy.config.use_cache = False
-    lora_config = LoraConfig(
-        r=args.lora_rank,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        bias="none",
-        task_type="CAUSAL_LM",
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-    )
-    policy = get_peft_model(policy, lora_config)
+    if args.adapter_path:
+        adapter_path = Path(args.adapter_path)
+        if not adapter_path.exists():
+            raise FileNotFoundError(f"Warm-start adapter path does not exist: {adapter_path}")
+        policy = PeftModel.from_pretrained(policy, adapter_path, is_trainable=True)
+    else:
+        lora_config = LoraConfig(
+            r=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        )
+        policy = get_peft_model(policy, lora_config)
     policy.to(device)
     policy.train()
 
@@ -228,6 +235,7 @@ def main() -> int:
     tokenizer.save_pretrained(output_dir)
     summary = {
         "model_path": args.model_path,
+        "adapter_path": args.adapter_path,
         "data": args.data,
         "output_dir": str(output_dir),
         "num_loaded_examples": len(data),

@@ -221,7 +221,7 @@ def run_full_algorithm_smoke(cfg: dict[str, Any]) -> dict[str, Any]:
         _require_nonempty(follower_wpo, "follower WPO")
 
         def train_command(role: str, data: Path, out: Path, steps_key: str) -> list[str]:
-            return [
+            command = [
                 "/opt/conda/bin/python", "-m", "stackelberg_codepo.training.weighted_dpo",
                 "--model-path", str(model["model_path"]),
                 "--data", str(data),
@@ -234,6 +234,9 @@ def run_full_algorithm_smoke(cfg: dict[str, Any]) -> dict[str, Any]:
                 "--beta", str(training.get("beta", 0.1)),
                 "--normalize-logprob",
             ]
+            adapter_key = "input_planner_adapter_path" if role == "leader" else "input_coder_adapter_path"
+            _append_if_value(command, "--adapter-path", model.get(adapter_key))
+            return command
 
         _run_stage("05_train_leader", train_command("leader", leader_clean_wpo, leader_adapter, "leader_train_steps"), project_root, env, log_dir, manifest)
         _run_stage("06_train_follower", train_command("follower", follower_wpo, follower_adapter, "follower_train_steps"), project_root, env, log_dir, manifest)

@@ -81,6 +81,14 @@ def run_ablation(cfg: dict[str, Any]) -> dict[str, Any]:
             command.extend(["--planner-adapter-path", str(planner_adapter)])
         if coder_adapter is not None:
             command.extend(["--coder-adapter-path", str(coder_adapter)])
+        if evaluation.get("best_so_far", False):
+            command.append("--best-so-far")
+        else:
+            command.append("--no-best-so-far")
+        if evaluation.get("repair_num_samples") is not None:
+            command.extend(["--repair-num-samples", str(evaluation["repair_num_samples"])])
+        if evaluation.get("repair_temperature") is not None:
+            command.extend(["--repair-temperature", str(evaluation["repair_temperature"])])
 
         log_path = logs_dir / f"{name}.log"
         with log_path.open("w", encoding="utf-8") as log:

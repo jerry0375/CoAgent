@@ -100,8 +100,13 @@ def planner_messages(
             )
         else:
             user = (
-                "The previous code did not fully solve the task. Give a repair plan for the coder.\n"
-                "Mention only the likely defect and the next correction. Do not write code.\n\n"
+                "The previous code did not fully solve the task. Diagnose the concrete defect from the failed assertions, "
+                "then give the smallest correction the coder should make. Do not write code.\n"
+                "Use this exact structure:\n"
+                "Likely defect: <one sentence>\n"
+                "Evidence: <cite the failed assertion or error>\n"
+                "Minimal correction: <one sentence>\n"
+                "Preserve: <behavior from the previous code that should not change>\n\n"
                 f"Task:\n{task.prompt}\n\n"
                 f"Previous code:\n{previous_code or ''}\n\n"
                 f"Execution feedback:\n{compact_feedback(previous_feedback or {})}"
@@ -121,8 +126,13 @@ def planner_messages(
         )
     else:
         user = (
-            "The previous code failed. Give a repair plan for the coder. "
-            "Do not write code.\n\n"
+            "The previous code failed. Diagnose the concrete defect from the failed assertions, "
+            "then give the smallest correction the coder should make. Do not write code.\n"
+            "Use this exact structure:\n"
+            "Likely defect: <one sentence>\n"
+            "Evidence: <cite the failed assertion or error>\n"
+            "Minimal correction: <one sentence>\n"
+            "Preserve: <behavior from the previous code that should not change>\n\n"
             f"Task:\n{task.prompt}\n\n"
             f"Previous code:\n{previous_code or ''}\n\n"
             f"Execution feedback:\n{compact_feedback(previous_feedback or {})}"
@@ -159,7 +169,7 @@ def coder_messages(
                 f"Execution feedback:\n{compact_feedback(previous_feedback or {})}\n\n"
                 f"Planner repair guidance:\n{plan}\n\n"
                 f"{incentive_text}\n\n"
-                "Now write a corrected complete Python function."
+                "Now write a corrected complete Python function. Make the smallest necessary logical change and preserve behavior that already passed."
             )
         return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
@@ -180,9 +190,22 @@ def coder_messages(
             f"Previous code:\n{previous_code or ''}\n\n"
             f"Execution feedback:\n{compact_feedback(previous_feedback or {})}\n\n"
             f"Planner repair guidance:\n{plan}\n\n"
-            "Now write a corrected complete Python function."
+            f"{incentive_text}\n\n"
+            "Now write a corrected complete Python function. Make the smallest necessary logical change and preserve behavior that already passed."
         )
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def pass_rate_from_turn(turn: dict) -> float:
+    return clamp01(float(turn.get("feedback", {}).get("pass_rate", 0.0)))
+
+
+def turn_sort_key(turn: dict) -> tuple[float, int, int]:
+    return (
+        pass_rate_from_turn(turn),
+        1 if bool(turn.get("feedback", {}).get("passed")) else 0,
+        -int(turn.get("code_tokens", 0)),
+    )
 
 
 def run_task(planner_model, planner_tokenizer, coder_model, coder_tokenizer, executor: HumanEvalExecutor, task: Task, args: argparse.Namespace) -> dict:
@@ -191,6 +214,7 @@ def run_task(planner_model, planner_tokenizer, coder_model, coder_tokenizer, exe
     previous_feedback = None
     first_round_passed = False
     best_pass_rate = 0.0
+    best_turn = None
 
     for round_index in range(1, args.max_rounds + 1):
         plan, planner_time, planner_prompt_tokens, planner_completion_tokens = chat_generate(
@@ -202,44 +226,63 @@ def run_task(planner_model, planner_tokenizer, coder_model, coder_tokenizer, exe
             args.top_p,
         )
         incentive_text = incentive_rule_text(args.demo_incentive_budget, args.demo_max_step_incentive, best_pass_rate)
-        generated, coder_time, coder_prompt_tokens, coder_completion_tokens = chat_generate(
-            coder_model,
-            coder_tokenizer,
-            coder_messages(task, plan, round_index, previous_code, previous_feedback, args.prompt_profile, incentive_text),
-            args.coder_max_new_tokens,
-            args.temperature,
-            args.top_p,
-        )
-        code, code_type = extract_code(generated, task)
-        code_tokens = token_count(coder_tokenizer, code)
         plan_tokens = token_count(planner_tokenizer, plan)
-        feedback = executor.execute(task, code, code_type=code_type)
+        sample_count = int(args.repair_num_samples) if round_index > 1 else 1
+        coder_temperature = float(args.repair_temperature) if round_index > 1 and args.repair_temperature is not None else float(args.temperature)
+        candidates = []
+        for sample_index in range(sample_count):
+            generated, coder_time, coder_prompt_tokens, coder_completion_tokens = chat_generate(
+                coder_model,
+                coder_tokenizer,
+                coder_messages(task, plan, round_index, previous_code, previous_feedback, args.prompt_profile, incentive_text),
+                args.coder_max_new_tokens,
+                coder_temperature,
+                args.top_p,
+            )
+            code, code_type = extract_code(generated, task)
+            code_tokens = token_count(coder_tokenizer, code)
+            feedback = executor.execute(task, code, code_type=code_type)
+            candidates.append(
+                {
+                    "round": round_index,
+                    "repair_sample_index": sample_index,
+                    "plan": plan,
+                    "planner_time": planner_time if sample_index == 0 else 0.0,
+                    "planner_prompt_tokens": planner_prompt_tokens if sample_index == 0 else 0,
+                    "planner_completion_tokens": planner_completion_tokens if sample_index == 0 else 0,
+                    "plan_tokens": plan_tokens if sample_index == 0 else 0,
+                    "generated_text": generated,
+                    "code": code,
+                    "code_type": code_type,
+                    "coder_time": coder_time,
+                    "coder_prompt_tokens": coder_prompt_tokens,
+                    "coder_completion_tokens": coder_completion_tokens,
+                    "code_tokens": code_tokens,
+                    "feedback": feedback.raw,
+                }
+            )
+
+        turn = dict(max(candidates, key=turn_sort_key))
+        if len(candidates) > 1:
+            turn["repair_candidate_count"] = len(candidates)
+            turn["coder_time_total"] = sum(float(candidate.get("coder_time", 0.0)) for candidate in candidates)
+            turn["coder_prompt_tokens_total"] = sum(int(candidate.get("coder_prompt_tokens", 0)) for candidate in candidates)
+            turn["coder_completion_tokens_total"] = sum(int(candidate.get("coder_completion_tokens", 0)) for candidate in candidates)
+            turn["repair_candidates"] = [dict(candidate) for candidate in candidates]
         if round_index == 1:
-            first_round_passed = bool(feedback.passed)
-        turn = {
-            "round": round_index,
-            "plan": plan,
-            "planner_time": planner_time,
-            "planner_prompt_tokens": planner_prompt_tokens,
-            "planner_completion_tokens": planner_completion_tokens,
-            "plan_tokens": plan_tokens,
-            "generated_text": generated,
-            "code": code,
-            "code_type": code_type,
-            "coder_time": coder_time,
-            "coder_prompt_tokens": coder_prompt_tokens,
-            "coder_completion_tokens": coder_completion_tokens,
-            "code_tokens": code_tokens,
-            "feedback": feedback.raw,
-        }
+            first_round_passed = bool(turn["feedback"].get("passed"))
         turns.append(turn)
-        previous_code = code
-        previous_feedback = feedback.raw
-        best_pass_rate = max(best_pass_rate, clamp01(float(feedback.raw.get("pass_rate", 0.0))))
-        if feedback.passed:
+        if best_turn is None or turn_sort_key(turn) > turn_sort_key(best_turn):
+            best_turn = turn
+        context_turn = best_turn if args.best_so_far else turn
+        previous_code = context_turn["code"]
+        previous_feedback = context_turn["feedback"]
+        best_pass_rate = max(best_pass_rate, pass_rate_from_turn(turn))
+        if bool(turn["feedback"].get("passed")):
             break
 
-    final_feedback = turns[-1]["feedback"] if turns else {}
+    final_turn = best_turn if args.best_so_far and best_turn is not None else (turns[-1] if turns else {})
+    final_feedback = final_turn.get("feedback", {}) if final_turn else {}
     return {
         "task_id": task.task_id,
         "source_task_id": task.source_task_id,
@@ -249,6 +292,9 @@ def run_task(planner_model, planner_tokenizer, coder_model, coder_tokenizer, exe
         "final_passed": bool(final_feedback.get("passed")),
         "rounds_used": len(turns),
         "final_pass_rate": float(final_feedback.get("pass_rate", 0.0)),
+        "final_selected_round": final_turn.get("round") if final_turn else None,
+        "best_so_far_enabled": bool(args.best_so_far),
+        "repair_num_samples": int(args.repair_num_samples),
         "turns": turns,
     }
 
@@ -280,7 +326,10 @@ def summarize(records: list[dict], args: argparse.Namespace) -> dict:
     lambda_token = float(getattr(args, "lambda_token", 0.00001))
     for item in records:
         p_tok = sum(int(turn.get("planner_prompt_tokens", 0)) + int(turn.get("planner_completion_tokens", 0)) for turn in item.get("turns", []))
-        c_tok = sum(int(turn.get("coder_prompt_tokens", 0)) + int(turn.get("coder_completion_tokens", 0)) for turn in item.get("turns", []))
+        c_tok = 0
+        for turn in item.get("turns", []):
+            c_tok += int(turn.get("coder_prompt_tokens_total", turn.get("coder_prompt_tokens", 0)))
+            c_tok += int(turn.get("coder_completion_tokens_total", turn.get("coder_completion_tokens", 0)))
         tok = p_tok + c_tok
         rounds_used = int(item.get("rounds_used", 0))
         quality = clamp01(float(item.get("final_pass_rate", 0.0)))
@@ -337,6 +386,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--prompt-profile", choices=("legacy", "training_aligned"), default="legacy")
+    parser.add_argument("--best-so-far", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--repair-num-samples", type=int, default=1)
+    parser.add_argument("--repair-temperature", type=float, default=None)
     parser.add_argument("--demo-incentive-budget", type=float, default=None)
     parser.add_argument("--demo-max-step-incentive", type=float, default=None)
     parser.add_argument("--no-resume", action="store_true")

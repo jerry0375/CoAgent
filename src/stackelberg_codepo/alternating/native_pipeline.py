@@ -76,6 +76,7 @@ def run_full_algorithm_smoke(cfg: dict[str, Any]) -> dict[str, Any]:
     training = table(cfg, "training")
     evaluation = table(cfg, "evaluation")
     leader_cleaning = table(cfg, "leader_cleaning")
+    follower_preference = table(cfg, "follower_preference")
 
     run_name = str(cfg.get("run_name", "full_algorithm_smoke"))
     work_dir = resolve_path(cfg, paths["work_dir"])
@@ -213,6 +214,19 @@ def run_full_algorithm_smoke(cfg: dict[str, Any]) -> dict[str, Any]:
             "--limit-states", str(sampling.get("follower_limit_states", 4)),
         ]
         _append_many(follower_command, "--temperatures", sampling.get("follower_temperatures", [0.2, 0.8]))
+        _append_if_value(follower_command, "--max-round1-states", follower_preference.get("max_round1_states"))
+        _append_if_value(follower_command, "--max-repair-states", follower_preference.get("max_repair_states"))
+        _append_if_value(follower_command, "--min-chosen-pass-rate", follower_preference.get("min_chosen_pass_rate"))
+        _append_if_value(follower_command, "--min-pass-rate-delta", follower_preference.get("min_pass_rate_delta"))
+        _append_if_value(follower_command, "--partial-chosen-weight-scale", follower_preference.get("partial_chosen_weight_scale"))
+        if follower_preference.get("prefer_repair_states", False):
+            follower_command.append("--prefer-repair-states")
+        if follower_preference.get("repair_only_states", False):
+            follower_command.append("--repair-only-states")
+        if follower_preference.get("require_chosen_passed", False):
+            follower_command.append("--require-chosen-passed")
+        if follower_preference.get("require_repair_improvement", False):
+            follower_command.append("--require-repair-improvement")
         follower_command.extend([
             "--top-p", str(sampling.get("top_p", 0.95)),
             "--seed", str(sampling.get("seed", 42)),
@@ -241,30 +255,30 @@ def run_full_algorithm_smoke(cfg: dict[str, Any]) -> dict[str, Any]:
         _run_stage("05_train_leader", train_command("leader", leader_clean_wpo, leader_adapter, "leader_train_steps"), project_root, env, log_dir, manifest)
         _run_stage("06_train_follower", train_command("follower", follower_wpo, follower_adapter, "follower_train_steps"), project_root, env, log_dir, manifest)
 
-        _run_stage(
-            "07_eval_joint",
-            [
-                "/opt/conda/bin/python", "-m", "stackelberg_codepo.evaluation.role_eval",
-                "--config", str(config_path),
-                "--model-path", str(model["model_path"]),
-                "--planner-adapter-path", str(leader_adapter),
-                "--coder-adapter-path", str(follower_adapter),
-                "--split", str(evaluation.get("eval_split", "test")),
-                "--limit", str(evaluation.get("eval_limit", 3)),
-                "--output-dir", str(eval_dir),
-                "--output-name", f"{run_name}_leader_follower_eval",
-                "--device", str(model.get("device", "cuda:0")),
-                "--max-rounds", str(evaluation.get("eval_max_rounds", 1)),
-                "--temperature", "0.0",
-                "--top-p", "1.0",
-                "--prompt-profile", str(evaluation.get("prompt_profile", "legacy")),
-                "--no-resume",
-            ],
-            project_root,
-            env,
-            log_dir,
-            manifest,
-        )
+        eval_command = [
+            "/opt/conda/bin/python", "-m", "stackelberg_codepo.evaluation.role_eval",
+            "--config", str(config_path),
+            "--model-path", str(model["model_path"]),
+            "--planner-adapter-path", str(leader_adapter),
+            "--coder-adapter-path", str(follower_adapter),
+            "--split", str(evaluation.get("eval_split", "test")),
+            "--limit", str(evaluation.get("eval_limit", 3)),
+            "--output-dir", str(eval_dir),
+            "--output-name", f"{run_name}_leader_follower_eval",
+            "--device", str(model.get("device", "cuda:0")),
+            "--max-rounds", str(evaluation.get("eval_max_rounds", 1)),
+            "--temperature", "0.0",
+            "--top-p", "1.0",
+            "--prompt-profile", str(evaluation.get("prompt_profile", "legacy")),
+            "--no-resume",
+        ]
+        if evaluation.get("best_so_far", False):
+            eval_command.append("--best-so-far")
+        else:
+            eval_command.append("--no-best-so-far")
+        _append_if_value(eval_command, "--repair-num-samples", evaluation.get("repair_num_samples"))
+        _append_if_value(eval_command, "--repair-temperature", evaluation.get("repair_temperature"))
+        _run_stage("07_eval_joint", eval_command, project_root, env, log_dir, manifest)
     finally:
         manifest["counts"] = {
             "trajectories": _count_jsonl(trajectories),

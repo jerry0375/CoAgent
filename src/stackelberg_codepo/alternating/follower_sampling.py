@@ -142,7 +142,16 @@ def sample_code(model, tokenizer, task: Task, state_text: str, temperature: floa
     return prompt, generated, code, code_type, elapsed
 
 
-def trajectory_states(trajectories: list[dict[str, Any]], task_map: dict[str, Task], max_states: int, seed: int, prefer_repair: bool) -> list[dict[str, Any]]:
+def trajectory_states(
+    trajectories: list[dict[str, Any]],
+    task_map: dict[str, Task],
+    max_states: int,
+    seed: int,
+    prefer_repair: bool,
+    repair_only: bool = False,
+    max_round1_states: int | None = None,
+    max_repair_states: int | None = None,
+) -> list[dict[str, Any]]:
     states: list[dict[str, Any]] = []
     for traj in trajectories:
         task = task_map.get(traj.get("task_id"))
@@ -186,7 +195,22 @@ def trajectory_states(trajectories: list[dict[str, Any]], task_map: dict[str, Ta
 
     rng = random.Random(seed)
     rng.shuffle(states)
-    if prefer_repair:
+    if repair_only:
+        states = [state for state in states if int(state["round"]) > 1]
+    if max_round1_states is not None or max_repair_states is not None:
+        round1 = [state for state in states if int(state["round"]) == 1]
+        repair = [state for state in states if int(state["round"]) > 1]
+        selected: list[dict[str, Any]] = []
+        selected.extend(round1[: max_round1_states or 0])
+        selected.extend(repair[: max_repair_states or 0])
+        if len(selected) < max_states:
+            used = {id(state) for state in selected}
+            remainder = [state for state in states if id(state) not in used]
+            if prefer_repair:
+                remainder.sort(key=lambda item: 0 if int(item["round"]) > 1 else 1)
+            selected.extend(remainder[: max_states - len(selected)])
+        states = selected
+    elif prefer_repair:
         states.sort(key=lambda item: 0 if int(item["round"]) > 1 else 1)
     return states[:max_states]
 
@@ -206,6 +230,11 @@ def make_preference_pairs(
     weight_min: float,
     weight_max: float,
     weight_power: float,
+    require_chosen_passed: bool,
+    min_chosen_pass_rate: float,
+    min_pass_rate_delta: float,
+    require_repair_improvement: bool,
+    partial_chosen_weight_scale: float,
 ) -> list[dict[str, Any]]:
     raw_pairs: list[tuple[dict[str, Any], dict[str, Any], float]] = []
     for a, b in itertools.combinations(candidates, 2):
@@ -213,6 +242,16 @@ def make_preference_pairs(
         if abs(diff) <= margin:
             continue
         chosen, rejected = (a, b) if diff > 0 else (b, a)
+        pass_rate_delta = float(chosen["pass_rate"]) - float(rejected["pass_rate"])
+        if pass_rate_delta < min_pass_rate_delta:
+            continue
+        if float(chosen["pass_rate"]) < min_chosen_pass_rate:
+            continue
+        if require_chosen_passed and not bool(chosen["passed"]):
+            continue
+        if require_repair_improvement and int(chosen["round"]) > 1:
+            if float(chosen["pass_rate"]) <= float(chosen["previous_best_pass_rate"]):
+                continue
         raw_pairs.append((chosen, rejected, abs(diff)))
     if not raw_pairs:
         return []
@@ -221,6 +260,8 @@ def make_preference_pairs(
     for chosen, rejected, delta in raw_pairs:
         raw_weight = delta / (avg_delta + 1e-8)
         weight = max(weight_min, min(weight_max, raw_weight ** weight_power))
+        if not bool(chosen["passed"]):
+            weight = max(weight_min, weight * partial_chosen_weight_scale)
         pairs.append(
             {
                 "task_id": chosen["task_id"],
@@ -241,6 +282,12 @@ def make_preference_pairs(
                 "weight": weight,
                 "chosen_metrics": chosen["metrics"],
                 "rejected_metrics": rejected["metrics"],
+                "chosen_passed": chosen["passed"],
+                "rejected_passed": rejected["passed"],
+                "chosen_pass_rate": chosen["pass_rate"],
+                "rejected_pass_rate": rejected["pass_rate"],
+                "pass_rate_delta": pass_rate_delta,
+                "previous_best_pass_rate": chosen["previous_best_pass_rate"],
                 "state_tokens": chosen["state_tokens"],
                 "chosen_code_tokens": chosen["code_tokens"],
                 "rejected_code_tokens": rejected["code_tokens"],
@@ -250,7 +297,7 @@ def make_preference_pairs(
 
 
 
-def apply_global_weights(pairs: list[dict[str, Any]], weight_min: float, weight_max: float, weight_power: float) -> None:
+def apply_global_weights(pairs: list[dict[str, Any]], weight_min: float, weight_max: float, weight_power: float, partial_chosen_weight_scale: float) -> None:
     if not pairs:
         return
     avg_delta = sum(float(pair["utility_delta"]) for pair in pairs) / len(pairs)
@@ -259,7 +306,10 @@ def apply_global_weights(pairs: list[dict[str, Any]], weight_min: float, weight_
         pair["local_raw_weight"] = pair.get("raw_weight")
         pair["local_weight"] = pair.get("weight")
         pair["raw_weight"] = raw_weight
-        pair["weight"] = max(weight_min, min(weight_max, raw_weight ** weight_power))
+        weight = max(weight_min, min(weight_max, raw_weight ** weight_power))
+        if not bool(pair.get("chosen_passed")):
+            weight = max(weight_min, weight * partial_chosen_weight_scale)
+        pair["weight"] = weight
 
 def weight_stats(pairs: list[dict[str, Any]]) -> dict[str, float | int]:
     weights = [float(p["weight"]) for p in pairs]
@@ -304,6 +354,12 @@ def write_wpo_jsonl(pairs: list[dict[str, Any]], candidates: dict[str, dict[str,
                     "chosen_utility": pair["chosen_utility"],
                     "rejected_utility": pair["rejected_utility"],
                     "raw_weight": pair["raw_weight"],
+                    "chosen_passed": pair.get("chosen_passed"),
+                    "rejected_passed": pair.get("rejected_passed"),
+                    "chosen_pass_rate": pair.get("chosen_pass_rate"),
+                    "rejected_pass_rate": pair.get("rejected_pass_rate"),
+                    "pass_rate_delta": pair.get("pass_rate_delta"),
+                    "previous_best_pass_rate": pair.get("previous_best_pass_rate"),
                 },
             }
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
@@ -321,6 +377,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--limit-states", type=int, default=6)
     parser.add_argument("--prefer-repair-states", action="store_true")
+    parser.add_argument("--repair-only-states", action="store_true")
+    parser.add_argument("--max-round1-states", type=int, default=None)
+    parser.add_argument("--max-repair-states", type=int, default=None)
     parser.add_argument("--temperatures", nargs="+", type=float, default=[0.2, 0.6, 0.8, 1.0])
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--seed", type=int, default=42)
@@ -329,6 +388,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-min", type=float, default=None)
     parser.add_argument("--weight-max", type=float, default=None)
     parser.add_argument("--weight-power", type=float, default=None)
+    parser.add_argument("--require-chosen-passed", action="store_true")
+    parser.add_argument("--min-chosen-pass-rate", type=float, default=0.0)
+    parser.add_argument("--min-pass-rate-delta", type=float, default=0.0)
+    parser.add_argument("--require-repair-improvement", action="store_true")
+    parser.add_argument("--partial-chosen-weight-scale", type=float, default=1.0)
     return parser.parse_args()
 
 
@@ -355,7 +419,16 @@ def main() -> int:
 
     trajectories = load_jsonl(Path(args.trajectories))
     task_map = load_task_map(cfg)
-    states = trajectory_states(trajectories, task_map, args.limit_states, args.seed, args.prefer_repair_states)
+    states = trajectory_states(
+        trajectories,
+        task_map,
+        args.limit_states,
+        args.seed,
+        args.prefer_repair_states,
+        repair_only=args.repair_only_states,
+        max_round1_states=args.max_round1_states,
+        max_repair_states=args.max_repair_states,
+    )
     configured_max_step_incentive = float(cfg.table("incentive").get("max_step_incentive", 0.08))
     for state in states:
         state["max_step_incentive"] = configured_max_step_incentive
@@ -440,14 +513,25 @@ def main() -> int:
                     flush=True,
                 )
 
-            pairs = make_preference_pairs(state_candidates, args.margin, weight_min, weight_max, weight_power)
+            pairs = make_preference_pairs(
+                state_candidates,
+                args.margin,
+                weight_min,
+                weight_max,
+                weight_power,
+                args.require_chosen_passed,
+                args.min_chosen_pass_rate,
+                args.min_pass_rate_delta,
+                args.require_repair_improvement,
+                args.partial_chosen_weight_scale,
+            )
             for pair in pairs:
                 pref_out.write(json.dumps(pair, ensure_ascii=False) + "\n")
             pref_out.flush()
             all_pairs.extend(pairs)
             print(f"    pairs={len(pairs)}", flush=True)
 
-    apply_global_weights(all_pairs, weight_min, weight_max, weight_power)
+    apply_global_weights(all_pairs, weight_min, weight_max, weight_power, args.partial_chosen_weight_scale)
     with preferences_path.open("w", encoding="utf-8") as pref_out:
         for pair in all_pairs:
             pref_out.write(json.dumps(pair, ensure_ascii=False) + "\n")
@@ -455,12 +539,25 @@ def main() -> int:
     wpo_examples = write_wpo_jsonl(all_pairs, candidate_by_id, wpo_path)
     tasks_with_pairs = len({pair["task_id"] for pair in all_pairs})
     states_with_pairs = len({pair["state_id"] for pair in all_pairs})
+    selected_round_counts: dict[str, int] = {}
+    for state in states:
+        key = str(state["round"])
+        selected_round_counts[key] = selected_round_counts.get(key, 0) + 1
+    pair_round_counts: dict[str, int] = {}
+    for pair in all_pairs:
+        key = str(pair["round"])
+        pair_round_counts[key] = pair_round_counts.get(key, 0) + 1
+    chosen_passed_count = sum(1 for pair in all_pairs if pair.get("chosen_passed"))
+    partial_chosen_count = len(all_pairs) - chosen_passed_count
+    chosen_pass_rates = [float(pair.get("chosen_pass_rate", 0.0)) for pair in all_pairs]
     summary = {
         "model_path": args.model_path,
         "num_states": len(states),
+        "selected_round_counts": selected_round_counts,
         "num_candidates": len(all_candidates),
         "num_preferences": len(all_pairs),
         "num_wpo_examples": wpo_examples,
+        "pair_round_counts": pair_round_counts,
         "tasks_with_preferences": tasks_with_pairs,
         "states_with_preferences": states_with_pairs,
         "temperatures": args.temperatures,
@@ -471,6 +568,14 @@ def main() -> int:
         "weight_min": weight_min,
         "weight_max": weight_max,
         "weight_power": weight_power,
+        "require_chosen_passed": args.require_chosen_passed,
+        "min_chosen_pass_rate": args.min_chosen_pass_rate,
+        "min_pass_rate_delta": args.min_pass_rate_delta,
+        "require_repair_improvement": args.require_repair_improvement,
+        "partial_chosen_weight_scale": args.partial_chosen_weight_scale,
+        "chosen_passed_count": chosen_passed_count,
+        "partial_chosen_count": partial_chosen_count,
+        "chosen_pass_rate_mean": sum(chosen_pass_rates) / len(chosen_pass_rates) if chosen_pass_rates else 0.0,
         "candidate_pass_rate_mean": sum(c["pass_rate"] for c in all_candidates) / len(all_candidates) if all_candidates else 0.0,
         "candidate_passed_count": sum(1 for c in all_candidates if c["passed"]),
         "avg_incentive": sum(c.get("incentive", 0.0) for c in all_candidates) / len(all_candidates) if all_candidates else 0.0,

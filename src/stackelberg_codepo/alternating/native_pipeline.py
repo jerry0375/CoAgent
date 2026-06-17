@@ -54,9 +54,49 @@ def _run_stage(name: str, command: list[str], cwd: Path, env: dict[str, str], lo
         raise RuntimeError(f"Stage failed: {name}; see {log_path}")
 
 
+def _skip_stage(name: str, command: list[str], log_dir: Path, manifest: dict[str, Any], reason: str) -> None:
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"{name}.log"
+    stage = {
+        "name": name,
+        "command": command,
+        "log_path": str(log_path),
+        "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "returncode": 0,
+        "skipped": True,
+        "skip_reason": reason,
+    }
+    manifest.setdefault("stages", []).append(stage)
+    with log_path.open("a", encoding="utf-8") as log:
+        log.write(json.dumps({"skipped": True, "reason": reason, "at": stage["finished_at"]}, ensure_ascii=False) + "\n")
+
+
+def _run_or_skip_stage(
+    name: str,
+    command: list[str],
+    cwd: Path,
+    env: dict[str, str],
+    log_dir: Path,
+    manifest: dict[str, Any],
+    *,
+    completed: bool,
+    resume: bool,
+    reason: str,
+) -> None:
+    if resume and completed:
+        _skip_stage(name, command, log_dir, manifest, reason)
+        return
+    _run_stage(name, command, cwd, env, log_dir, manifest)
+
+
 def _require_nonempty(path: Path, label: str) -> None:
     if not _count_jsonl(path):
         raise RuntimeError(f"{label} is empty or missing: {path}")
+
+
+def _adapter_exists(path: Path) -> bool:
+    return (path / "adapter_model.safetensors").exists() or (path / "adapter_model.bin").exists()
 
 
 def run_full_algorithm_smoke(cfg: dict[str, Any]) -> dict[str, Any]:
@@ -79,6 +119,7 @@ def run_full_algorithm_smoke(cfg: dict[str, Any]) -> dict[str, Any]:
     follower_preference = table(cfg, "follower_preference")
 
     run_name = str(cfg.get("run_name", "full_algorithm_smoke"))
+    resume_stages = bool(cfg.get("resume_stages", True))
     work_dir = resolve_path(cfg, paths["work_dir"])
     sample_dir = work_dir / "sample"
     leader_round_dir = work_dir / "leader_round"
@@ -155,24 +196,38 @@ def run_full_algorithm_smoke(cfg: dict[str, Any]) -> dict[str, Any]:
             "--seed", str(sampling.get("seed", 42)),
             "--max-rounds", str(sampling.get("sample_max_rounds", 1)),
         ])
-        _run_stage("01_sample_trajectories", sample_command, project_root, env, log_dir, manifest)
-        _require_nonempty(trajectories, "trajectories")
-        _require_nonempty(trajectory_preferences, "trajectory preferences")
-
-        _run_stage(
-            "02_convert_leader_round_pairs",
-            [
-                "/opt/conda/bin/python", "-m", "stackelberg_codepo.preference.leader_round_conversion",
-                "--preferences", str(trajectory_preferences),
-                "--trajectories", str(trajectories),
-                "--output-dir", str(leader_round_dir),
-                "--all-name", leader_all_name,
-                "--strong-name", f"{run_name}_leader_round_strong",
-            ],
+        _run_or_skip_stage(
+            "01_sample_trajectories",
+            sample_command,
             project_root,
             env,
             log_dir,
             manifest,
+            completed=bool(_count_jsonl(trajectories)) and bool(_count_jsonl(trajectory_preferences)),
+            resume=resume_stages,
+            reason="trajectories and trajectory preferences already exist",
+        )
+        _require_nonempty(trajectories, "trajectories")
+        _require_nonempty(trajectory_preferences, "trajectory preferences")
+
+        convert_command = [
+            "/opt/conda/bin/python", "-m", "stackelberg_codepo.preference.leader_round_conversion",
+            "--preferences", str(trajectory_preferences),
+            "--trajectories", str(trajectories),
+            "--output-dir", str(leader_round_dir),
+            "--all-name", leader_all_name,
+            "--strong-name", f"{run_name}_leader_round_strong",
+        ]
+        _run_or_skip_stage(
+            "02_convert_leader_round_pairs",
+            convert_command,
+            project_root,
+            env,
+            log_dir,
+            manifest,
+            completed=bool(_count_jsonl(leader_round_wpo)),
+            resume=resume_stages,
+            reason="leader round WPO already exists",
         )
         _require_nonempty(leader_round_wpo, "leader round WPO")
 
@@ -193,13 +248,16 @@ def run_full_algorithm_smoke(cfg: dict[str, Any]) -> dict[str, Any]:
             clean_command.append("--require-chosen-passed")
         if leader_cleaning.get("drop_rejected_overreach", False):
             clean_command.append("--drop-rejected-overreach")
-        _run_stage(
+        _run_or_skip_stage(
             "03_clean_initial_leader_pairs",
             clean_command,
             project_root,
             env,
             log_dir,
             manifest,
+            completed=bool(_count_jsonl(leader_clean_wpo)),
+            resume=resume_stages,
+            reason="clean leader WPO already exists",
         )
         _require_nonempty(leader_clean_wpo, "clean leader WPO")
 
@@ -231,7 +289,17 @@ def run_full_algorithm_smoke(cfg: dict[str, Any]) -> dict[str, Any]:
             "--top-p", str(sampling.get("top_p", 0.95)),
             "--seed", str(sampling.get("seed", 42)),
         ])
-        _run_stage("04_build_follower_pairs", follower_command, project_root, env, log_dir, manifest)
+        _run_or_skip_stage(
+            "04_build_follower_pairs",
+            follower_command,
+            project_root,
+            env,
+            log_dir,
+            manifest,
+            completed=bool(_count_jsonl(follower_wpo)),
+            resume=resume_stages,
+            reason="follower WPO already exists",
+        )
         _require_nonempty(follower_wpo, "follower WPO")
 
         def train_command(role: str, data: Path, out: Path, steps_key: str) -> list[str]:
@@ -252,8 +320,30 @@ def run_full_algorithm_smoke(cfg: dict[str, Any]) -> dict[str, Any]:
             _append_if_value(command, "--adapter-path", model.get(adapter_key))
             return command
 
-        _run_stage("05_train_leader", train_command("leader", leader_clean_wpo, leader_adapter, "leader_train_steps"), project_root, env, log_dir, manifest)
-        _run_stage("06_train_follower", train_command("follower", follower_wpo, follower_adapter, "follower_train_steps"), project_root, env, log_dir, manifest)
+        leader_train_command = train_command("leader", leader_clean_wpo, leader_adapter, "leader_train_steps")
+        _run_or_skip_stage(
+            "05_train_leader",
+            leader_train_command,
+            project_root,
+            env,
+            log_dir,
+            manifest,
+            completed=_adapter_exists(leader_adapter),
+            resume=resume_stages,
+            reason="leader adapter already exists",
+        )
+        follower_train_command = train_command("follower", follower_wpo, follower_adapter, "follower_train_steps")
+        _run_or_skip_stage(
+            "06_train_follower",
+            follower_train_command,
+            project_root,
+            env,
+            log_dir,
+            manifest,
+            completed=_adapter_exists(follower_adapter),
+            resume=resume_stages,
+            reason="follower adapter already exists",
+        )
 
         eval_command = [
             "/opt/conda/bin/python", "-m", "stackelberg_codepo.evaluation.role_eval",
@@ -279,7 +369,19 @@ def run_full_algorithm_smoke(cfg: dict[str, Any]) -> dict[str, Any]:
         _append_if_value(eval_command, "--repair-num-samples", evaluation.get("repair_num_samples"))
         _append_if_value(eval_command, "--repair-temperature", evaluation.get("repair_temperature"))
         _append_if_value(eval_command, "--coder-adapter-start-round", evaluation.get("coder_adapter_start_round"))
-        _run_stage("07_eval_joint", eval_command, project_root, env, log_dir, manifest)
+        eval_summary = eval_dir / f"{run_name}_leader_follower_eval_summary.json"
+        eval_jsonl = eval_dir / f"{run_name}_leader_follower_eval.jsonl"
+        _run_or_skip_stage(
+            "07_eval_joint",
+            eval_command,
+            project_root,
+            env,
+            log_dir,
+            manifest,
+            completed=eval_summary.exists() and bool(_count_jsonl(eval_jsonl)),
+            resume=resume_stages,
+            reason="joint eval summary already exists",
+        )
     finally:
         manifest["counts"] = {
             "trajectories": _count_jsonl(trajectories),

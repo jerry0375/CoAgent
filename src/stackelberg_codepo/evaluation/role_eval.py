@@ -208,7 +208,17 @@ def turn_sort_key(turn: dict) -> tuple[float, int, int]:
     )
 
 
-def run_task(planner_model, planner_tokenizer, coder_model, coder_tokenizer, executor: HumanEvalExecutor, task: Task, args: argparse.Namespace) -> dict:
+def run_task(
+    planner_model,
+    planner_tokenizer,
+    coder_model,
+    coder_tokenizer,
+    executor: HumanEvalExecutor,
+    task: Task,
+    args: argparse.Namespace,
+    early_coder_model=None,
+    early_coder_tokenizer=None,
+) -> dict:
     turns = []
     previous_code = None
     previous_feedback = None
@@ -229,18 +239,23 @@ def run_task(planner_model, planner_tokenizer, coder_model, coder_tokenizer, exe
         plan_tokens = token_count(planner_tokenizer, plan)
         sample_count = int(args.repair_num_samples) if round_index > 1 else 1
         coder_temperature = float(args.repair_temperature) if round_index > 1 and args.repair_temperature is not None else float(args.temperature)
+        active_coder_model = coder_model
+        active_coder_tokenizer = coder_tokenizer
+        if early_coder_model is not None and round_index < int(args.coder_adapter_start_round):
+            active_coder_model = early_coder_model
+            active_coder_tokenizer = early_coder_tokenizer
         candidates = []
         for sample_index in range(sample_count):
             generated, coder_time, coder_prompt_tokens, coder_completion_tokens = chat_generate(
-                coder_model,
-                coder_tokenizer,
+                active_coder_model,
+                active_coder_tokenizer,
                 coder_messages(task, plan, round_index, previous_code, previous_feedback, args.prompt_profile, incentive_text),
                 args.coder_max_new_tokens,
                 coder_temperature,
                 args.top_p,
             )
             code, code_type = extract_code(generated, task)
-            code_tokens = token_count(coder_tokenizer, code)
+            code_tokens = token_count(active_coder_tokenizer, code)
             feedback = executor.execute(task, code, code_type=code_type)
             candidates.append(
                 {
@@ -295,6 +310,7 @@ def run_task(planner_model, planner_tokenizer, coder_model, coder_tokenizer, exe
         "final_selected_round": final_turn.get("round") if final_turn else None,
         "best_so_far_enabled": bool(args.best_so_far),
         "repair_num_samples": int(args.repair_num_samples),
+        "coder_adapter_start_round": int(args.coder_adapter_start_round),
         "turns": turns,
     }
 
@@ -375,6 +391,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", default=None)
     parser.add_argument("--planner-adapter-path", default=None, help="Optional PEFT/LoRA adapter path for planner generation.")
     parser.add_argument("--coder-adapter-path", default=None, help="Optional PEFT/LoRA adapter path for coder generation.")
+    parser.add_argument("--coder-adapter-start-round", type=int, default=1, help="Use the coder adapter only from this round onward; earlier rounds use the base coder.")
     parser.add_argument("--split", choices=("test", "valid", "train", "all"), default="test")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--output-dir", default=str(ROOT / "outputs" / "role_demo"))
@@ -419,10 +436,17 @@ def main() -> int:
     tasks = iter_tasks(cfg, args.split, args.limit)
     existing = {} if args.no_resume else read_existing(result_path)
     planner_model, planner_tokenizer = load_model_and_tokenizer(args.model_path, args.device, args.planner_adapter_path)
+    early_coder_model = None
+    early_coder_tokenizer = None
     if args.coder_adapter_path == args.planner_adapter_path:
         coder_model, coder_tokenizer = planner_model, planner_tokenizer
     else:
         coder_model, coder_tokenizer = load_model_and_tokenizer(args.model_path, args.device, args.coder_adapter_path)
+    if args.coder_adapter_path and int(args.coder_adapter_start_round) > 1:
+        if args.planner_adapter_path is None:
+            early_coder_model, early_coder_tokenizer = planner_model, planner_tokenizer
+        else:
+            early_coder_model, early_coder_tokenizer = load_model_and_tokenizer(args.model_path, args.device)
     executor = HumanEvalExecutor(cfg.phase1_dir)
 
     completed = dict(existing)
@@ -433,7 +457,17 @@ def main() -> int:
                 print(f"[{index}/{len(tasks)}] skip {task.task_id}", flush=True)
                 continue
             print(f"[{index}/{len(tasks)}] role-demo {task.task_id} {task.source_task_id} {task.entry_point}", flush=True)
-            item = run_task(planner_model, planner_tokenizer, coder_model, coder_tokenizer, executor, task, args)
+            item = run_task(
+                planner_model,
+                planner_tokenizer,
+                coder_model,
+                coder_tokenizer,
+                executor,
+                task,
+                args,
+                early_coder_model=early_coder_model,
+                early_coder_tokenizer=early_coder_tokenizer,
+            )
             out.write(json.dumps(item, ensure_ascii=False) + "\n")
             out.flush()
             completed[task.task_id] = item

@@ -278,6 +278,7 @@ def run_full_algorithm_smoke(cfg: dict[str, Any]) -> dict[str, Any]:
             eval_command.append("--no-best-so-far")
         _append_if_value(eval_command, "--repair-num-samples", evaluation.get("repair_num_samples"))
         _append_if_value(eval_command, "--repair-temperature", evaluation.get("repair_temperature"))
+        _append_if_value(eval_command, "--coder-adapter-start-round", evaluation.get("coder_adapter_start_round"))
         _run_stage("07_eval_joint", eval_command, project_root, env, log_dir, manifest)
     finally:
         manifest["counts"] = {

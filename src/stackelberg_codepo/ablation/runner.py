@@ -89,6 +89,8 @@ def run_ablation(cfg: dict[str, Any]) -> dict[str, Any]:
             command.extend(["--repair-num-samples", str(evaluation["repair_num_samples"])])
         if evaluation.get("repair_temperature") is not None:
             command.extend(["--repair-temperature", str(evaluation["repair_temperature"])])
+        if evaluation.get("coder_adapter_start_round") is not None:
+            command.extend(["--coder-adapter-start-round", str(evaluation["coder_adapter_start_round"])])
 
         log_path = logs_dir / f"{name}.log"
         with log_path.open("w", encoding="utf-8") as log:

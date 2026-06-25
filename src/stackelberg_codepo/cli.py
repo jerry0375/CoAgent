@@ -4,7 +4,13 @@ import argparse
 import json
 from pathlib import Path
 
-from stackelberg_codepo.alternating import run_from_trajectories, run_full_algorithm_smoke, run_real_paper_smoke, run_tiny_smoke
+from stackelberg_codepo.alternating import (
+    run_from_trajectories,
+    run_full_algorithm_smoke,
+    run_real_paper_smoke,
+    run_strict_alternating_smoke,
+    run_tiny_smoke,
+)
 from stackelberg_codepo.config import load_config
 from stackelberg_codepo.verification.migration import run_verification
 from stackelberg_codepo.ablation.runner import run_ablation
@@ -25,6 +31,9 @@ def parse_args() -> argparse.Namespace:
 
     full = sub.add_parser("full-algorithm-smoke", help="Run sample -> preference -> train -> eval through the native full algorithm pipeline.")
     full.add_argument("--config", default="configs/full_algorithm_smoke.json")
+
+    strict = sub.add_parser("strict-alternating-smoke", help="Run paper-faithful follower-first then leader-resample alternating pipeline.")
+    strict.add_argument("--config", default="configs/strict_alternating_smoke.json")
 
     verify = sub.add_parser("verify-migration", help="Verify native migration gates and artifact invariants.")
     verify.add_argument("--output", default=None)
@@ -55,6 +64,11 @@ def main() -> int:
     if args.command == "full-algorithm-smoke":
         cfg = load_config(Path(args.config))
         report = run_full_algorithm_smoke(cfg)
+        print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)
+        return 0
+    if args.command == "strict-alternating-smoke":
+        cfg = load_config(Path(args.config))
+        report = run_strict_alternating_smoke(cfg)
         print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)
         return 0
     if args.command == "verify-migration":

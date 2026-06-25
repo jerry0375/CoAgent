@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+from stackelberg_codepo.modeling.chat_template import safe_apply_chat_template
+
 import argparse
 import itertools
 import json
@@ -122,7 +124,7 @@ def sample_code(model, tokenizer, task: Task, state_text: str, temperature: floa
     random.seed(seed)
 
     messages = coder_messages(task, state_text)
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    prompt = safe_apply_chat_template(tokenizer, messages, add_generation_prompt=True)
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     kwargs: dict[str, Any] = {
         "max_new_tokens": max_new_tokens,
@@ -376,6 +378,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-prefix", default="follower_pref_from_traj")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--limit-states", type=int, default=6)
+    parser.add_argument("--num-shards", type=int, default=1, help="Split selected states into this many modulo shards.")
+    parser.add_argument("--shard-index", type=int, default=0, help="Run only states whose selected index belongs to this shard.")
+    parser.add_argument("--candidate-id-prefix", default="cand", help="Prefix for generated candidate IDs.")
     parser.add_argument("--prefer-repair-states", action="store_true")
     parser.add_argument("--repair-only-states", action="store_true")
     parser.add_argument("--max-round1-states", type=int, default=None)
@@ -393,6 +398,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-pass-rate-delta", type=float, default=0.0)
     parser.add_argument("--require-repair-improvement", action="store_true")
     parser.add_argument("--partial-chosen-weight-scale", type=float, default=1.0)
+    parser.add_argument("--load-in-8bit", action="store_true")
+    parser.add_argument("--load-in-4bit", action="store_true")
     return parser.parse_args()
 
 
@@ -429,10 +436,21 @@ def main() -> int:
         max_round1_states=args.max_round1_states,
         max_repair_states=args.max_repair_states,
     )
+    if args.num_shards < 1:
+        raise ValueError("--num-shards must be >= 1")
+    if args.shard_index < 0 or args.shard_index >= args.num_shards:
+        raise ValueError("--shard-index must be in [0, num_shards)")
+    selected_before_shard = len(states)
+    if args.num_shards > 1:
+        states = [state for index, state in enumerate(states) if index % args.num_shards == args.shard_index]
+        print(
+            f"state shard {args.shard_index}/{args.num_shards}: {len(states)} of {selected_before_shard} selected states",
+            flush=True,
+        )
     configured_max_step_incentive = float(cfg.table("incentive").get("max_step_incentive", 0.08))
     for state in states:
         state["max_step_incentive"] = configured_max_step_incentive
-    model, tokenizer = load_model_and_tokenizer(args.model_path, args.device)
+    model, tokenizer = load_model_and_tokenizer(args.model_path, args.device, load_in_8bit=args.load_in_8bit, load_in_4bit=args.load_in_4bit)
     executor = HumanEvalExecutor(cfg.phase1_dir)
 
     all_candidates: list[dict[str, Any]] = []
@@ -459,7 +477,7 @@ def main() -> int:
                 feedback = executor.execute(task, code, code_type=code_type)
                 code_tokens = token_count(tokenizer, code)
                 candidate = {
-                    "candidate_id": f"cand_{candidate_counter:08d}",
+                    "candidate_id": f"{args.candidate_id_prefix}_{candidate_counter:08d}",
                     "task_id": task.task_id,
                     "source_task_id": task.source_task_id,
                     "split": task.split,
@@ -553,6 +571,9 @@ def main() -> int:
     summary = {
         "model_path": args.model_path,
         "num_states": len(states),
+        "num_states_before_shard": selected_before_shard,
+        "num_shards": args.num_shards,
+        "shard_index": args.shard_index,
         "selected_round_counts": selected_round_counts,
         "num_candidates": len(all_candidates),
         "num_preferences": len(all_pairs),

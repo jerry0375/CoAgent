@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+from stackelberg_codepo.modeling.chat_template import safe_apply_chat_template
+
 import argparse
 import itertools
 import json
@@ -162,7 +164,7 @@ def chat_generate(model, tokenizer, messages: list[dict[str, str]], max_new_toke
         torch.cuda.manual_seed_all(seed)
     random.seed(seed)
 
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    prompt = safe_apply_chat_template(tokenizer, messages, add_generation_prompt=True)
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     kwargs: dict[str, Any] = {
         "max_new_tokens": max_new_tokens,
@@ -191,6 +193,24 @@ def parse_effort_tokens(plan: str) -> int | None:
         if match:
             return int(match.group(1))
     return None
+
+
+def static_task_budget(task: Task, tokenizer, inc_cfg: dict[str, Any], args: argparse.Namespace) -> dict[str, float]:
+    prompt_tokens = token_count(tokenizer, task.prompt)
+    test_tokens = token_count(tokenizer, task.test)
+    estimate_tokens = int(clamp(prompt_tokens + 0.25 * test_tokens, args.difficulty_estimate_min, args.difficulty_estimate_max))
+    details = incentive_budget_from_estimate(estimate_tokens, inc_cfg)
+    details["static_prompt_tokens"] = float(prompt_tokens)
+    details["static_test_tokens"] = float(test_tokens)
+    return details
+
+
+def build_shuffled_budget_map(tasks: list[Task], tokenizer, inc_cfg: dict[str, Any], args: argparse.Namespace) -> dict[str, dict[str, float]]:
+    source_details = [static_task_budget(task, tokenizer, inc_cfg, args) for task in tasks]
+    shuffled_details = [dict(item) for item in source_details]
+    rng = random.Random(int(inc_cfg.get("shuffle_seed", args.seed + 7919)))
+    rng.shuffle(shuffled_details)
+    return {task.task_id: detail for task, detail in zip(tasks, shuffled_details)}
 
 
 def incentive_budget_from_estimate(estimate_tokens: int, inc_cfg: dict[str, Any]) -> dict[str, float]:
@@ -349,6 +369,7 @@ def run_trajectory(
     planner_temperature: float,
     args: argparse.Namespace,
     inc_cfg: dict[str, Any],
+    shuffled_budget_map: dict[str, dict[str, float]] | None = None,
 ) -> dict[str, Any]:
     previous_code = None
     previous_feedback = None
@@ -381,9 +402,16 @@ def run_trajectory(
             test_tokens = token_count(planner_tokenizer, task.test)
             calibrated_floor = int(plan_tokens + 0.25 * prompt_tokens + 0.10 * test_tokens)
             estimate_tokens = int(clamp(max(raw_estimate or 0, calibrated_floor), args.difficulty_estimate_min, args.difficulty_estimate_max))
-            difficulty_details = incentive_budget_from_estimate(estimate_tokens, inc_cfg)
-            difficulty_details["leader_raw_effort_tokens"] = float(raw_estimate or 0)
-            difficulty_details["calibrated_floor_tokens"] = float(calibrated_floor)
+            policy = str(inc_cfg.get("policy", "exp_token_difficulty"))
+            if incentive_enabled and policy == "shuffled_exp_token_difficulty" and shuffled_budget_map is not None:
+                difficulty_details = dict(shuffled_budget_map.get(task.task_id) or incentive_budget_from_estimate(estimate_tokens, inc_cfg))
+                difficulty_details["shuffled_from_static_budget"] = 1.0
+                difficulty_details["leader_raw_effort_tokens"] = float(raw_estimate or 0)
+                difficulty_details["calibrated_floor_tokens"] = float(calibrated_floor)
+            else:
+                difficulty_details = incentive_budget_from_estimate(estimate_tokens, inc_cfg)
+                difficulty_details["leader_raw_effort_tokens"] = float(raw_estimate or 0)
+                difficulty_details["calibrated_floor_tokens"] = float(calibrated_floor)
             total_budget = float(difficulty_details["total_incentive_budget"]) if incentive_enabled else 0.0
 
         incentive_text = incentive_rule_text(total_budget, max_step_incentive, best_pass_rate) if incentive_enabled else "Incentive rule: none."
@@ -471,7 +499,7 @@ def run_trajectory(
         "context_tokens": context_tokens,
         "communication_tokens": communication_tokens,
         "cost_token_mode": args.cost_token_mode,
-        "incentive_rule": "exp_token_difficulty" if incentive_enabled else "none",
+        "incentive_rule": str(inc_cfg.get("policy", "exp_token_difficulty")) if incentive_enabled else "none",
         "incentive_total": incentive_total,
         "role_boundary_penalty_total": role_boundary_penalty_total,
         "incentive_budget": total_budget,
@@ -508,6 +536,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", choices=("train", "valid", "test", "all"), default="train")
     parser.add_argument("--limit", type=int, default=3)
     parser.add_argument("--shuffle-tasks", action="store_true", help="Shuffle the selected split before applying --limit.")
+    parser.add_argument("--num-shards", type=int, default=1, help="Split selected tasks into this many modulo shards.")
+    parser.add_argument("--shard-index", type=int, default=0, help="Run only tasks whose selected index belongs to this shard.")
+    parser.add_argument("--id-prefix", default="traj", help="Prefix for generated trajectory IDs.")
     parser.add_argument("--output-dir", default=str(ROOT / "outputs" / "preference_demo"))
     parser.add_argument("--output-prefix", default="leader_pref_demo")
     parser.add_argument("--device", default="cuda:0")
@@ -530,6 +561,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-min", type=float, default=None)
     parser.add_argument("--weight-max", type=float, default=None)
     parser.add_argument("--weight-power", type=float, default=None)
+    parser.add_argument("--load-in-8bit", action="store_true")
+    parser.add_argument("--load-in-4bit", action="store_true")
     return parser.parse_args()
 
 
@@ -566,12 +599,26 @@ def main() -> int:
             tasks = tasks[: args.limit]
     else:
         tasks = iter_tasks(cfg, args.split, args.limit)
-    planner_model, planner_tokenizer = load_model_and_tokenizer(args.model_path, args.device, args.planner_adapter_path)
+    if args.num_shards < 1:
+        raise ValueError("--num-shards must be >= 1")
+    if args.shard_index < 0 or args.shard_index >= args.num_shards:
+        raise ValueError("--shard-index must be in [0, num_shards)")
+    if args.num_shards > 1:
+        selected_before_shard = len(tasks)
+        tasks = [task for index, task in enumerate(tasks) if index % args.num_shards == args.shard_index]
+        print(
+            f"task shard {args.shard_index}/{args.num_shards}: {len(tasks)} of {selected_before_shard} selected tasks",
+            flush=True,
+        )
+    planner_model, planner_tokenizer = load_model_and_tokenizer(args.model_path, args.device, args.planner_adapter_path, args.load_in_8bit, args.load_in_4bit)
     if args.coder_adapter_path == args.planner_adapter_path:
         coder_model, coder_tokenizer = planner_model, planner_tokenizer
     else:
-        coder_model, coder_tokenizer = load_model_and_tokenizer(args.model_path, args.device, args.coder_adapter_path)
+        coder_model, coder_tokenizer = load_model_and_tokenizer(args.model_path, args.device, args.coder_adapter_path, args.load_in_8bit, args.load_in_4bit)
     executor = HumanEvalExecutor(cfg.phase1_dir)
+    incentive_policy = str(inc_cfg.get("policy", "exp_token_difficulty"))
+    incentive_enabled = bool(inc_cfg.get("enabled", True)) and not args.disable_incentive
+    shuffled_budget_map = build_shuffled_budget_map(tasks, planner_tokenizer, inc_cfg, args) if incentive_enabled and incentive_policy == "shuffled_exp_token_difficulty" else None
 
     all_trajectories: list[dict[str, Any]] = []
     all_pairs: list[dict[str, Any]] = []
@@ -595,8 +642,9 @@ def main() -> int:
                     planner_temperature,
                     args,
                     inc_cfg,
+                    shuffled_budget_map,
                 )
-                trajectory["trajectory_id"] = f"traj_{trajectory_counter:08d}"
+                trajectory["trajectory_id"] = f"{args.id_prefix}_{trajectory_counter:08d}"
                 trajectory_counter += 1
                 traj_out.write(json.dumps(trajectory, ensure_ascii=False) + "\n")
                 traj_out.flush()
@@ -626,6 +674,8 @@ def main() -> int:
         "coder_adapter_path": args.coder_adapter_path,
         "split": args.split,
         "num_tasks": len(tasks),
+        "num_shards": args.num_shards,
+        "shard_index": args.shard_index,
         "num_trajectories": len(all_trajectories),
         "num_preferences": len(all_pairs),
         "tasks_with_preferences": tasks_with_pairs,
@@ -637,7 +687,9 @@ def main() -> int:
         "lambda_round": args.lambda_round,
         "lambda_token": args.lambda_token,
         "cost_token_mode": args.cost_token_mode,
-        "incentive_policy": "disabled" if args.disable_incentive else inc_cfg.get("policy", "exp_token_difficulty"),
+        "incentive_policy": "disabled" if not incentive_enabled else incentive_policy,
+        "shuffled_incentive": bool(shuffled_budget_map),
+        "shuffle_seed": inc_cfg.get("shuffle_seed"),
         "margin": margin,
         "weight_min": weight_min,
         "weight_max": weight_max,

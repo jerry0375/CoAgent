@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+from stackelberg_codepo.modeling.chat_template import safe_apply_chat_template
+
 import argparse
 import json
 from pathlib import Path
@@ -10,8 +12,8 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
-from peft import LoraConfig, PeftModel, get_peft_model
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -47,7 +49,7 @@ def response_text(item: dict[str, Any], key: str) -> str:
 
 def build_sequence(tokenizer, item: dict[str, Any], response_key: str, max_length: int, device: torch.device) -> dict[str, torch.Tensor]:
     messages = convert_messages(item["conversations"])
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    prompt = safe_apply_chat_template(tokenizer, messages, add_generation_prompt=True)
     prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
     resp = response_text(item, response_key)
     response_ids = tokenizer.encode(resp, add_special_tokens=False)
@@ -67,11 +69,30 @@ def build_sequence(tokenizer, item: dict[str, Any], response_key: str, max_lengt
     labels = [-100] * len(prompt_ids) + response_ids
     attention_mask = [1] * len(input_ids)
     return {
-        "input_ids": torch.tensor([input_ids], dtype=torch.long, device=device),
-        "labels": torch.tensor([labels], dtype=torch.long, device=device),
-        "attention_mask": torch.tensor([attention_mask], dtype=torch.long, device=device),
+        "input_ids": torch.tensor(input_ids, dtype=torch.long, device=device),
+        "labels": torch.tensor(labels, dtype=torch.long, device=device),
+        "attention_mask": torch.tensor(attention_mask, dtype=torch.long, device=device),
         "response_len": torch.tensor(len(response_ids), dtype=torch.long, device=device),
         "total_len": torch.tensor(len(input_ids), dtype=torch.long, device=device),
+    }
+
+
+def collate_sequences(sequences: list[dict[str, torch.Tensor]], pad_token_id: int, device: torch.device) -> dict[str, torch.Tensor]:
+    max_len = max(int(seq["total_len"].detach().cpu().item()) for seq in sequences)
+    input_rows: list[torch.Tensor] = []
+    label_rows: list[torch.Tensor] = []
+    mask_rows: list[torch.Tensor] = []
+    for seq in sequences:
+        pad_len = max_len - int(seq["total_len"].detach().cpu().item())
+        input_rows.append(F.pad(seq["input_ids"], (0, pad_len), value=pad_token_id))
+        label_rows.append(F.pad(seq["labels"], (0, pad_len), value=-100))
+        mask_rows.append(F.pad(seq["attention_mask"], (0, pad_len), value=0))
+    return {
+        "input_ids": torch.stack(input_rows).to(device),
+        "labels": torch.stack(label_rows).to(device),
+        "attention_mask": torch.stack(mask_rows).to(device),
+        "response_len": torch.stack([seq["response_len"] for seq in sequences]).to(device),
+        "total_len": torch.stack([seq["total_len"] for seq in sequences]).to(device),
     }
 
 
@@ -120,7 +141,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora-rank", type=int, default=8)
     parser.add_argument("--lora-alpha", type=int, default=16)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--normalize-logprob", action="store_true", help="Use mean response log-prob instead of summed log-prob.")
+    parser.add_argument("--load-in-8bit", action="store_true", help="Load policy/reference base models with bitsandbytes 8-bit quantization.")
+    parser.add_argument("--load-in-4bit", action="store_true", help="Load policy/reference base models with bitsandbytes 4-bit NF4 quantization.")
     return parser.parse_args()
 
 
@@ -141,16 +166,45 @@ def main() -> int:
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, local_files_only=True, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
+    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    if pad_token_id is None:
+        raise ValueError("Tokenizer must define pad_token_id or eos_token_id")
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+    if args.load_in_8bit and args.load_in_4bit:
+        raise ValueError("Use only one of --load-in-8bit or --load-in-4bit")
+    quantization_config = None
+    device_map = None
+    if args.load_in_8bit or args.load_in_4bit:
+        if device.type != "cuda":
+            raise ValueError("k-bit loading requires a CUDA device")
+        device_map = {"": device.index if device.index is not None else 0}
+        if args.load_in_4bit:
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+            )
+            event = "load_in_4bit_enabled"
+        else:
+            quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+            event = "load_in_8bit_enabled"
+        print(json.dumps({"event": event, "device_map": device_map}, ensure_ascii=False), flush=True)
 
-    policy = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
-        local_files_only=True,
-        trust_remote_code=True,
-        torch_dtype=dtype,
-        low_cpu_mem_usage=True,
-    )
+    common_load_kwargs = {
+        "local_files_only": True,
+        "trust_remote_code": True,
+        "torch_dtype": dtype,
+        "low_cpu_mem_usage": True,
+    }
+    if quantization_config is not None:
+        common_load_kwargs["quantization_config"] = quantization_config
+        common_load_kwargs["device_map"] = device_map
+
+    policy = AutoModelForCausalLM.from_pretrained(args.model_path, **common_load_kwargs)
     policy.config.use_cache = False
+    if args.load_in_8bit or args.load_in_4bit:
+        policy = prepare_model_for_kbit_training(policy)
     if args.adapter_path:
         adapter_path = Path(args.adapter_path)
         if not adapter_path.exists():
@@ -166,18 +220,14 @@ def main() -> int:
             target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         )
         policy = get_peft_model(policy, lora_config)
-    policy.to(device)
+    if not (args.load_in_8bit or args.load_in_4bit):
+        policy.to(device)
     policy.train()
 
-    reference = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
-        local_files_only=True,
-        trust_remote_code=True,
-        torch_dtype=dtype,
-        low_cpu_mem_usage=True,
-    )
+    reference = AutoModelForCausalLM.from_pretrained(args.model_path, **common_load_kwargs)
     reference.config.use_cache = False
-    reference.to(device)
+    if not (args.load_in_8bit or args.load_in_4bit):
+        reference.to(device)
     reference.eval()
     for param in reference.parameters():
         param.requires_grad_(False)
@@ -188,42 +238,76 @@ def main() -> int:
     log_path = output_dir / "weighted_dpo_smoke_log.jsonl"
 
     logs: list[dict[str, Any]] = []
+    batch_size = max(1, args.batch_size)
+    grad_accum = max(1, args.gradient_accumulation_steps)
     for step in range(args.max_steps):
-        item = data[step % len(data)]
-        weight = float(item.get("weight", 1.0))
-        weight_tensor = torch.tensor([weight], dtype=torch.float32, device=device)
-        chosen = build_sequence(tokenizer, item, "chosen", args.max_length, device)
-        rejected = build_sequence(tokenizer, item, "rejected", args.max_length, device)
-
-        policy_chosen = sequence_logprob(policy, chosen, args.normalize_logprob)
-        policy_rejected = sequence_logprob(policy, rejected, args.normalize_logprob)
-        with torch.no_grad():
-            ref_chosen = sequence_logprob(reference, chosen, args.normalize_logprob)
-            ref_rejected = sequence_logprob(reference, rejected, args.normalize_logprob)
-
-        unweighted_loss, logits = dpo_loss(policy_chosen, policy_rejected, ref_chosen, ref_rejected, args.beta)
-        weighted_loss = (unweighted_loss * weight_tensor).mean()
         optimizer.zero_grad(set_to_none=True)
-        weighted_loss.backward()
+        step_rows: list[dict[str, Any]] = []
+        total_weighted_loss = 0.0
+        total_unweighted_loss = 0.0
+        total_weight = 0.0
+        total_items = 0
+        last_logits: torch.Tensor | None = None
+        for micro_step in range(grad_accum):
+            start = (step * grad_accum + micro_step) * batch_size
+            batch_items = [data[(start + i) % len(data)] for i in range(batch_size)]
+            weights = [float(item.get("weight", 1.0)) for item in batch_items]
+            weight_tensor = torch.tensor(weights, dtype=torch.float32, device=device)
+            chosen = collate_sequences(
+                [build_sequence(tokenizer, item, "chosen", args.max_length, device) for item in batch_items],
+                int(pad_token_id),
+                device,
+            )
+            rejected = collate_sequences(
+                [build_sequence(tokenizer, item, "rejected", args.max_length, device) for item in batch_items],
+                int(pad_token_id),
+                device,
+            )
+
+            policy_chosen = sequence_logprob(policy, chosen, args.normalize_logprob)
+            policy_rejected = sequence_logprob(policy, rejected, args.normalize_logprob)
+            with torch.no_grad():
+                ref_chosen = sequence_logprob(reference, chosen, args.normalize_logprob)
+                ref_rejected = sequence_logprob(reference, rejected, args.normalize_logprob)
+
+            unweighted_loss, logits = dpo_loss(policy_chosen, policy_rejected, ref_chosen, ref_rejected, args.beta)
+            weighted_loss = (unweighted_loss * weight_tensor).mean()
+            (weighted_loss / grad_accum).backward()
+            last_logits = logits.detach()
+            total_weighted_loss += float(weighted_loss.detach().cpu().item()) * len(batch_items)
+            total_unweighted_loss += float(unweighted_loss.detach().mean().cpu().item()) * len(batch_items)
+            total_weight += sum(weights)
+            total_items += len(batch_items)
+            for idx, item in enumerate(batch_items):
+                step_rows.append({
+                    "weight": weights[idx],
+                    "unweighted_loss": float(unweighted_loss[idx].detach().cpu().item()),
+                    "weighted_loss": float((unweighted_loss[idx] * weight_tensor[idx]).detach().cpu().item()),
+                    "dpo_logit": float(logits[idx].detach().cpu().item()),
+                    "policy_chosen_logp": float(policy_chosen[idx].detach().cpu().item()),
+                    "policy_rejected_logp": float(policy_rejected[idx].detach().cpu().item()),
+                    "ref_chosen_logp": float(ref_chosen[idx].detach().cpu().item()),
+                    "ref_rejected_logp": float(ref_rejected[idx].detach().cpu().item()),
+                    "chosen_response_len": int(chosen["response_len"][idx].detach().cpu().item()),
+                    "rejected_response_len": int(rejected["response_len"][idx].detach().cpu().item()),
+                    "chosen_total_len": int(chosen["total_len"][idx].detach().cpu().item()),
+                    "rejected_total_len": int(rejected["total_len"][idx].detach().cpu().item()),
+                    "metadata": item.get("metadata", {}),
+                })
         grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
         optimizer.step()
 
         row = {
             "step": step + 1,
-            "weight": weight,
-            "unweighted_loss": float(unweighted_loss.detach().cpu().item()),
-            "weighted_loss": float(weighted_loss.detach().cpu().item()),
-            "dpo_logit": float(logits.detach().cpu().item()),
-            "policy_chosen_logp": float(policy_chosen.detach().cpu().item()),
-            "policy_rejected_logp": float(policy_rejected.detach().cpu().item()),
-            "ref_chosen_logp": float(ref_chosen.detach().cpu().item()),
-            "ref_rejected_logp": float(ref_rejected.detach().cpu().item()),
-            "chosen_response_len": int(chosen["response_len"].detach().cpu().item()),
-            "rejected_response_len": int(rejected["response_len"].detach().cpu().item()),
-            "chosen_total_len": int(chosen["total_len"].detach().cpu().item()),
-            "rejected_total_len": int(rejected["total_len"].detach().cpu().item()),
+            "batch_size": batch_size,
+            "gradient_accumulation_steps": grad_accum,
+            "effective_batch_size": batch_size * grad_accum,
+            "weight": total_weight / max(total_items, 1),
+            "unweighted_loss": total_unweighted_loss / max(total_items, 1),
+            "weighted_loss": total_weighted_loss / max(total_items, 1),
+            "dpo_logit": float(last_logits.mean().cpu().item()) if last_logits is not None else 0.0,
             "grad_norm": float(grad_norm.detach().cpu().item()) if torch.is_tensor(grad_norm) else float(grad_norm),
-            "metadata": item.get("metadata", {}),
+            "examples": step_rows,
         }
         logs.append(row)
         print(json.dumps(row, ensure_ascii=False), flush=True)
@@ -240,9 +324,17 @@ def main() -> int:
         "output_dir": str(output_dir),
         "num_loaded_examples": len(data),
         "max_steps": args.max_steps,
+        "batch_size": batch_size,
+        "gradient_accumulation_steps": grad_accum,
+        "effective_batch_size": batch_size * grad_accum,
+        "lora_rank": args.lora_rank,
+        "lora_alpha": args.lora_alpha,
+        "lora_dropout": args.lora_dropout,
         "beta": args.beta,
         "learning_rate": args.learning_rate,
         "normalize_logprob": args.normalize_logprob,
+        "load_in_8bit": args.load_in_8bit,
+        "load_in_4bit": args.load_in_4bit,
         "log_path": str(log_path),
         "mean_weight": sum(row["weight"] for row in logs) / len(logs) if logs else 0.0,
         "mean_unweighted_loss": sum(row["unweighted_loss"] for row in logs) / len(logs) if logs else 0.0,

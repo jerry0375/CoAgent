@@ -1,0 +1,71 @@
+{
+  "run_name": "ablation_iter1_train131_round4_aggressive_iter4_r32_step300_core",
+  "paths": {
+    "output_dir": "outputs/ablation_iter1_train131_round4_aggressive_iter4_r32_step300_core",
+    "full_run_dir": "outputs/full_algorithm_iter1_train131_round4_aggressive_iter4_r32_step300",
+    "phase1_dir": "../humaneval_phase1",
+    "task_file": "../humaneval_phase1/data/processed/humaneval/test.jsonl",
+    "train_file": "../humaneval_phase1/data/processed/humaneval/train.jsonl",
+    "valid_file": "../humaneval_phase1/data/processed/humaneval/valid.jsonl"
+  },
+  "model": {
+    "model_path": "/workspace/models/Qwen2.5-Coder-1.5B-Instruct",
+    "cuda_visible_devices": "0",
+    "device": "cuda:0"
+  },
+  "evaluation": {
+    "split": "test",
+    "limit": 17,
+    "max_rounds": 4,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "prompt_profile": "legacy",
+    "best_so_far": true,
+    "coder_adapter_start_round": 2
+  },
+  "variants": [
+    {
+      "name": "prompt_only",
+      "planner_adapter": null,
+      "coder_adapter": null
+    },
+    {
+      "name": "leader_only",
+      "planner_adapter": "leader",
+      "coder_adapter": null
+    },
+    {
+      "name": "follower_repair_only",
+      "planner_adapter": null,
+      "coder_adapter": "follower"
+    },
+    {
+      "name": "full_repair_only",
+      "planner_adapter": "leader",
+      "coder_adapter": "follower"
+    }
+  ],
+  "cost": {
+    "lambda_round": 0.02,
+    "lambda_token": 1e-05,
+    "lambda_follower_token": 1e-05,
+    "alpha_eff": 0.0,
+    "beta_pass": 1.0,
+    "beta_delta_pass": 0.5,
+    "approx_chars_per_token": 4.0,
+    "leader_token_mode": "context_and_outputs",
+    "follower_token_mode": "current_code_only"
+  },
+  "incentive": {
+    "enabled": true,
+    "policy": "exp_token_difficulty",
+    "total_budget_base": 0.035,
+    "total_budget_min": 0.0,
+    "total_budget_max": 0.16,
+    "max_step_incentive": 0.08,
+    "difficulty_token_ref": 256,
+    "difficulty_token_scale": 256,
+    "difficulty_gamma": 0.45,
+    "max_difficulty_multiplier": 3.0
+  }
+}

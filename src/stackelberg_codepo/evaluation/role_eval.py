@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+from stackelberg_codepo.modeling.chat_template import safe_apply_chat_template
+
 import argparse
+import math
+import random
 from collections import Counter
 import json
 from pathlib import Path
@@ -47,7 +51,7 @@ def compact_feedback(feedback_raw: dict, max_asserts: int = 8) -> str:
 def chat_generate(model, tokenizer, messages: list[dict[str, str]], max_new_tokens: int, temperature: float, top_p: float) -> tuple[str, float, int, int]:
     import torch
 
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    prompt = safe_apply_chat_template(tokenizer, messages, add_generation_prompt=True)
     prompt_tokens = token_count(tokenizer, prompt)
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     start = time.perf_counter()
@@ -66,6 +70,30 @@ def chat_generate(model, tokenizer, messages: list[dict[str, str]], max_new_toke
     generated = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
     completion_tokens = int(new_tokens.shape[-1])
     return generated, elapsed, prompt_tokens, completion_tokens
+
+
+def static_task_budget(task: Task, tokenizer, inc_cfg: dict, args: argparse.Namespace) -> float:
+    base = float(inc_cfg.get("total_budget_base", inc_cfg.get("budget_base", 0.035)))
+    ref = float(inc_cfg.get("difficulty_token_ref", 256.0))
+    scale = max(1.0, float(inc_cfg.get("difficulty_token_scale", 256.0)))
+    gamma = float(inc_cfg.get("difficulty_gamma", 0.45))
+    max_multiplier = float(inc_cfg.get("max_difficulty_multiplier", 3.0))
+    budget_min = float(inc_cfg.get("total_budget_min", 0.0))
+    budget_max = float(inc_cfg.get("total_budget_max", inc_cfg.get("max_step_incentive", 0.25)))
+    prompt_tokens = token_count(tokenizer, task.prompt)
+    test_tokens = token_count(tokenizer, task.test)
+    estimate = max(80.0, min(800.0, float(prompt_tokens) + 0.25 * float(test_tokens)))
+    normalized = max(-3.0, min(3.0, (estimate - ref) / scale))
+    multiplier = max(1.0 / max_multiplier, min(max_multiplier, math.exp(gamma * normalized)))
+    return max(budget_min, min(budget_max, base * multiplier))
+
+
+def build_shuffled_budget_map(tasks: list[Task], tokenizer, inc_cfg: dict, args: argparse.Namespace) -> dict[str, float]:
+    budgets = [static_task_budget(task, tokenizer, inc_cfg, args) for task in tasks]
+    rng = random.Random(int(inc_cfg.get("shuffle_seed", 7919)))
+    shuffled = list(budgets)
+    rng.shuffle(shuffled)
+    return {task.task_id: budget for task, budget in zip(tasks, shuffled)}
 
 
 def incentive_rule_text(total_budget: float, max_step_incentive: float, best_pass_rate: float) -> str:
@@ -235,7 +263,11 @@ def run_task(
             args.temperature,
             args.top_p,
         )
-        incentive_text = incentive_rule_text(args.demo_incentive_budget, args.demo_max_step_incentive, best_pass_rate)
+        if getattr(args, "incentive_enabled", True):
+            total_budget = float(getattr(args, "shuffled_incentive_budget_by_task", {}).get(task.task_id, args.demo_incentive_budget))
+            incentive_text = incentive_rule_text(total_budget, args.demo_max_step_incentive, best_pass_rate)
+        else:
+            incentive_text = "Incentive rule: none."
         plan_tokens = token_count(planner_tokenizer, plan)
         sample_count = int(args.repair_num_samples) if round_index > 1 else 1
         coder_temperature = float(args.repair_temperature) if round_index > 1 and args.repair_temperature is not None else float(args.temperature)
@@ -373,6 +405,9 @@ def summarize(records: list[dict], args: argparse.Namespace) -> dict:
         "prompt_profile": getattr(args, "prompt_profile", "legacy"),
         "demo_incentive_budget": getattr(args, "demo_incentive_budget", None),
         "demo_max_step_incentive": getattr(args, "demo_max_step_incentive", None),
+        "incentive_enabled": getattr(args, "incentive_enabled", True),
+        "incentive_policy": getattr(args, "incentive_policy", "exp_token_difficulty"),
+        "shuffled_incentive": bool(getattr(args, "shuffled_incentive_budget_by_task", {})),
         "lambda_round": lambda_round,
         "lambda_token": lambda_token,
         "avg_planner_tokens": sum(planner_tokens) / total if total else 0.0,
@@ -408,6 +443,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repair-temperature", type=float, default=None)
     parser.add_argument("--demo-incentive-budget", type=float, default=None)
     parser.add_argument("--demo-max-step-incentive", type=float, default=None)
+    parser.add_argument("--load-in-8bit", action="store_true", help="Load eval models with bitsandbytes 8-bit quantization.")
+    parser.add_argument("--load-in-4bit", action="store_true", help="Load eval models with bitsandbytes 4-bit NF4 quantization.")
     parser.add_argument("--no-resume", action="store_true")
     return parser.parse_args()
 
@@ -421,10 +458,12 @@ def main() -> int:
     args.lambda_round = float(cost_cfg.get("lambda_round", 0.02))
     args.lambda_token = float(cost_cfg.get("lambda_token", 0.00001))
     inc_cfg = cfg.table("incentive")
+    args.incentive_policy = str(inc_cfg.get("policy", "exp_token_difficulty"))
+    args.incentive_enabled = bool(inc_cfg.get("enabled", True))
     if args.demo_incentive_budget is None:
-        args.demo_incentive_budget = float(inc_cfg.get("total_budget_base", 0.035))
+        args.demo_incentive_budget = float(inc_cfg.get("total_budget_base", 0.035)) if args.incentive_enabled else 0.0
     if args.demo_max_step_incentive is None:
-        args.demo_max_step_incentive = float(inc_cfg.get("max_step_incentive", 0.08))
+        args.demo_max_step_incentive = float(inc_cfg.get("max_step_incentive", 0.08)) if args.incentive_enabled else 0.0
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -435,18 +474,21 @@ def main() -> int:
 
     tasks = iter_tasks(cfg, args.split, args.limit)
     existing = {} if args.no_resume else read_existing(result_path)
-    planner_model, planner_tokenizer = load_model_and_tokenizer(args.model_path, args.device, args.planner_adapter_path)
+    planner_model, planner_tokenizer = load_model_and_tokenizer(args.model_path, args.device, args.planner_adapter_path, args.load_in_8bit, args.load_in_4bit)
     early_coder_model = None
     early_coder_tokenizer = None
     if args.coder_adapter_path == args.planner_adapter_path:
         coder_model, coder_tokenizer = planner_model, planner_tokenizer
     else:
-        coder_model, coder_tokenizer = load_model_and_tokenizer(args.model_path, args.device, args.coder_adapter_path)
+        coder_model, coder_tokenizer = load_model_and_tokenizer(args.model_path, args.device, args.coder_adapter_path, args.load_in_8bit, args.load_in_4bit)
     if args.coder_adapter_path and int(args.coder_adapter_start_round) > 1:
         if args.planner_adapter_path is None:
             early_coder_model, early_coder_tokenizer = planner_model, planner_tokenizer
         else:
-            early_coder_model, early_coder_tokenizer = load_model_and_tokenizer(args.model_path, args.device)
+            early_coder_model, early_coder_tokenizer = load_model_and_tokenizer(args.model_path, args.device, load_in_8bit=args.load_in_8bit, load_in_4bit=args.load_in_4bit)
+    args.shuffled_incentive_budget_by_task = {}
+    if args.incentive_enabled and args.incentive_policy == "shuffled_exp_token_difficulty":
+        args.shuffled_incentive_budget_by_task = build_shuffled_budget_map(tasks, planner_tokenizer, inc_cfg, args)
     executor = HumanEvalExecutor(cfg.phase1_dir)
 
     completed = dict(existing)

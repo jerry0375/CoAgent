@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+from stackelberg_codepo.modeling.chat_template import safe_apply_chat_template
+
 import argparse
 from collections import Counter
 import json
@@ -162,7 +164,7 @@ def generate_one(model, tokenizer, task: Task, args) -> tuple[str, str, str, flo
     import torch
 
     messages = build_messages(task, args.prompt_style)
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    prompt = safe_apply_chat_template(tokenizer, messages, add_generation_prompt=True)
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     start = time.perf_counter()
     with torch.inference_mode():
@@ -181,27 +183,44 @@ def generate_one(model, tokenizer, task: Task, args) -> tuple[str, str, str, flo
     return generated, code, code_type, elapsed
 
 
-def load_model_and_tokenizer(model_path: str, device: str, adapter_path: str | None = None):
+def load_model_and_tokenizer(model_path: str, device: str, adapter_path: str | None = None, load_in_8bit: bool = False, load_in_4bit: bool = False):
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        local_files_only=True,
-        trust_remote_code=True,
-        torch_dtype=dtype,
-        low_cpu_mem_usage=True,
-    )
+    if load_in_8bit and load_in_4bit:
+        raise ValueError("Use only one of load_in_8bit or load_in_4bit")
+    torch_device = torch.device(device)
+    kwargs = {
+        "local_files_only": True,
+        "trust_remote_code": True,
+        "torch_dtype": dtype,
+        "low_cpu_mem_usage": True,
+    }
+    if load_in_8bit or load_in_4bit:
+        if torch_device.type != "cuda":
+            raise ValueError("k-bit loading requires a CUDA device")
+        if load_in_4bit:
+            kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+            )
+        else:
+            kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+        kwargs["device_map"] = {"": torch_device.index if torch_device.index is not None else 0}
+    model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
     if adapter_path:
         from peft import PeftModel
 
         model = PeftModel.from_pretrained(model, adapter_path, local_files_only=True)
-    model.to(device)
+    if not (load_in_8bit or load_in_4bit):
+        model.to(device)
     model.eval()
     return model, tokenizer
 

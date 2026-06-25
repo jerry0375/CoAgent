@@ -303,6 +303,7 @@ def run_full_algorithm_smoke(cfg: dict[str, Any]) -> dict[str, Any]:
         _require_nonempty(follower_wpo, "follower WPO")
 
         def train_command(role: str, data: Path, out: Path, steps_key: str) -> list[str]:
+            role_prefix = f"{role}_"
             command = [
                 "/opt/conda/bin/python", "-m", "stackelberg_codepo.training.weighted_dpo",
                 "--model-path", str(model["model_path"]),
@@ -314,6 +315,11 @@ def run_full_algorithm_smoke(cfg: dict[str, Any]) -> dict[str, Any]:
                 "--max-length", str(training.get("train_max_length", 1024)),
                 "--learning-rate", str(training.get("learning_rate", 5e-6)),
                 "--beta", str(training.get("beta", 0.1)),
+                "--lora-rank", str(training.get(f"{role_prefix}lora_rank", training.get("lora_rank", 8))),
+                "--lora-alpha", str(training.get(f"{role_prefix}lora_alpha", training.get("lora_alpha", 16))),
+                "--lora-dropout", str(training.get(f"{role_prefix}lora_dropout", training.get("lora_dropout", 0.05))),
+                "--batch-size", str(training.get(f"{role_prefix}batch_size", training.get("batch_size", 1))),
+                "--gradient-accumulation-steps", str(training.get(f"{role_prefix}gradient_accumulation_steps", training.get("gradient_accumulation_steps", 1))),
                 "--normalize-logprob",
             ]
             adapter_key = "input_planner_adapter_path" if role == "leader" else "input_coder_adapter_path"

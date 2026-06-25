@@ -1,0 +1,144 @@
+{
+  "run_name": "strict_iter3_strict_train131_round4_iter4_r32_step300",
+  "resume_stages": true,
+  "paths": {
+    "work_dir": "outputs/strict_iter3_strict_train131_round4_iter4_r32_step300",
+    "phase1_dir": "../humaneval_phase1",
+    "task_file": "../humaneval_phase1/data/processed/humaneval/test.jsonl",
+    "train_file": "../humaneval_phase1/data/processed/humaneval/train.jsonl",
+    "valid_file": "../humaneval_phase1/data/processed/humaneval/valid.jsonl"
+  },
+  "model": {
+    "model_path": "/workspace/models/Qwen2.5-Coder-1.5B-Instruct",
+    "input_planner_adapter_path": "/workspace/multi_agent/stackelberg_codepo/outputs/strict_iter2_strict_train131_round4_iter4_r32_step300/adapters/leader",
+    "input_coder_adapter_path": "/workspace/multi_agent/stackelberg_codepo/outputs/strict_iter2_strict_train131_round4_iter4_r32_step300/adapters/follower",
+    "cuda_visible_devices": "0",
+    "device": "cuda:0"
+  },
+  "sampling": {
+    "sample_split": "train",
+    "sample_limit": 131,
+    "sample_max_rounds": 4,
+    "planner_temperatures": [
+      0.2,
+      0.5,
+      0.8,
+      1.0
+    ],
+    "coder_temperature": 0.2,
+    "top_p": 0.95,
+    "seed": 45,
+    "follower_limit_states": 640,
+    "follower_temperatures": [
+      0.2,
+      0.5,
+      0.8,
+      1.0
+    ]
+  },
+  "follower_preference": {
+    "require_chosen_passed": true,
+    "min_pass_rate_delta": 0.1,
+    "max_round1_states": 160,
+    "max_repair_states": 480
+  },
+  "training": {
+    "leader_train_steps": 200,
+    "follower_train_steps": 300,
+    "train_max_samples": 1024,
+    "train_max_length": 1536,
+    "learning_rate": 8e-06,
+    "beta": 0.1,
+    "lora_rank": 32,
+    "lora_alpha": 64,
+    "lora_dropout": 0.05,
+    "batch_size": 4,
+    "gradient_accumulation_steps": 2,
+    "leader_batch_size": 4,
+    "leader_gradient_accumulation_steps": 2,
+    "follower_batch_size": 2,
+    "follower_gradient_accumulation_steps": 4
+  },
+  "evaluation": {
+    "eval_split": "test",
+    "eval_limit": 17,
+    "eval_max_rounds": 4,
+    "prompt_profile": "legacy",
+    "best_so_far": true,
+    "coder_adapter_start_round": 2
+  },
+  "experiment": {
+    "name": "stackelberg_codepo_strict_train131_round4_iter4",
+    "seed": 45,
+    "max_rounds": 4
+  },
+  "generation": {
+    "temperature": 0.2,
+    "top_p": 0.95,
+    "max_new_tokens": 768,
+    "num_samples_planner": 4,
+    "num_samples_coder": 4
+  },
+  "execution": {
+    "timeout_seconds": 3.0,
+    "use_assert_level_pass_rate": true,
+    "use_memory_metric": false,
+    "use_efficiency_as_constraint": false
+  },
+  "cost": {
+    "lambda_round": 0.02,
+    "lambda_token": 1e-05,
+    "lambda_follower_token": 1e-05,
+    "alpha_eff": 0.0,
+    "beta_pass": 1.0,
+    "beta_delta_pass": 0.5,
+    "approx_chars_per_token": 4.0,
+    "leader_token_mode": "context_and_outputs",
+    "follower_token_mode": "current_code_only"
+  },
+  "incentive": {
+    "enabled": true,
+    "policy": "exp_token_difficulty",
+    "total_budget_base": 0.035,
+    "total_budget_min": 0.0,
+    "total_budget_max": 0.16,
+    "max_step_incentive": 0.08,
+    "difficulty_token_ref": 256,
+    "difficulty_token_scale": 256,
+    "difficulty_gamma": 0.45,
+    "max_difficulty_multiplier": 3.0
+  },
+  "preference": {
+    "leader_margin": 0.03,
+    "weight_min": 0.3,
+    "weight_max": 2.0,
+    "weight_power": 0.65
+  },
+  "role_boundary": {
+    "enabled": true,
+    "lambda_code_block": 0.08,
+    "lambda_function_def": 0.1,
+    "lambda_assert": 0.06,
+    "lambda_test_scaffold": 0.06,
+    "lambda_code_intent": 0.03,
+    "max_penalty": 0.25
+  },
+  "difficulty": {
+    "easy_max_asserts": 4,
+    "medium_max_asserts": 9
+  },
+  "leader_cleaning": {
+    "min_chosen_pass_rate": 0.7,
+    "max_pairs_per_task": 4,
+    "min_response_chars": 80,
+    "drop_rejected_overreach": false
+  },
+  "parallel_sampling": {
+    "enabled": true,
+    "num_shards": 2,
+    "cuda_visible_devices": [
+      "0",
+      "2"
+    ]
+  }
+}
